@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Biophysical Skin Renderer v2 — editable base color</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         background:#15171c; color:#d7dbe0; margin:0; padding:24px; }
+  .wrap { max-width:840px; margin:0 auto; display:grid; gap:20px;
+          grid-template-columns: 280px 1fr; }
+  @media (max-width: 700px){
+    body { padding:12px; }
+    .wrap { grid-template-columns: 1fr; gap:14px; }
+    #view { width:100%; max-width:100%; }
+    .row { grid-template-columns: 104px 1fr 44px; }
+  }
+  h1 { grid-column:1/-1; font-size:16px; margin:0; color:#fff; }
+  .sub { grid-column:1/-1; margin:-12px 0 0; color:#6b7480; font-size:12px; }
+  #view { width:280px; height:auto; max-width:280px; border-radius:14px;
+          box-shadow:0 8px 28px rgba(0,0,0,.5); display:block; }
+  .viewbox { display:grid; gap:12px; align-content:start; }
+  .thumbs { display:flex; gap:8px; }
+  .thumb { display:grid; gap:3px; justify-items:center; }
+  .thumb canvas { width:80px; height:80px; border-radius:8px; border:1px solid #2a2f37; }
+  .thumb span { font-size:10px; color:#6b7480; }
+  .row { display:grid; grid-template-columns:120px 1fr 56px; align-items:center; gap:10px; }
+  .row label { color:#9aa3ad; }
+  input[type=range] { width:100%; }
+  .val { text-align:right; color:#cfd6dd; }
+  .baserow { display:grid; grid-template-columns:120px auto 1fr; align-items:center; gap:10px; }
+  .baserow label { color:#9aa3ad; }
+  input[type=color] { width:48px; height:28px; border:1px solid #363b44; border-radius:6px;
+                      background:#262a31; cursor:pointer; padding:2px; }
+  .prow { grid-column:1/-1; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .plabel { font-size:11px; color:#6b7480; width:54px; }
+  .presets { display:flex; gap:10px; flex-wrap:wrap; }
+  button { background:#262a31; color:#e6eaef; border:1px solid #363b44;
+           border-radius:8px; padding:8px 14px; cursor:pointer; font:inherit; }
+  button:hover { background:#2f343c; }
+  .texbtn { display:flex; align-items:center; gap:6px; padding:4px 8px; }
+  .texbtn img { width:30px; height:30px; border-radius:5px; object-fit:cover; }
+  .texbtn.active { border-color:#6aa9e0; background:#2f3a48; }
+  .sw { display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:6px;
+        vertical-align:middle; border:1px solid rgba(255,255,255,.25); }
+  pre { grid-column:1/-1; background:#1b1e24; border:1px solid #2a2f37;
+        border-radius:10px; padding:14px; margin:0; color:#aeb6bf; white-space:pre-wrap; }
+  .panel { display:grid; gap:12px; align-content:start; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Biophysical Skin Renderer v2 — substrate = grayscale × base color</h1>
+  <p class="sub">개량 버전: substrate를 단일 base color(편집 가능) + 회색 디테일로 한 번 더 분리.</p>
+
+  <div class="viewbox">
+    <canvas id="view" width="280" height="280"></canvas>
+    <div class="thumbs">
+      <div class="thumb"><canvas id="t_gray"></canvas><span>grayscale</span></div>
+      <div class="thumb"><canvas id="t_mel"></canvas><span>melanin</span></div>
+      <div class="thumb"><canvas id="t_hem"></canvas><span>hemoglobin</span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="baserow">
+      <label>Base Color</label>
+      <input type="color" id="baseColor" value="#c59580">
+      <span class="val" id="baseHex" style="text-align:left">#c59580</span>
+    </div>
+    <div id="controls"></div>
+  </div>
+
+  <div class="prow"><span class="plabel">Texture</span><div class="presets" id="textures"></div></div>
+  <div class="prow"><span class="plabel">Melanin</span><div class="presets" id="melRow"></div></div>
+  <div class="prow"><span class="plabel">Hemoglobin</span><div class="presets" id="hemRow"></div></div>
+  <div class="prow"><span class="plabel">Skin</span><div class="presets" id="presets"></div></div>
+  <div class="prow"><span class="plabel">MST</span><div class="presets" id="mst"></div></div>
+  <pre id="readout">loading textures …</pre>
+</div>
+
+<script>
+// v2 model. The improved decomposer (skin_decompose_v2.py) split the pigment-
+// neutral substrate into a single editable Base Color + a grayscale detail map,
+// combined with a Photoshop "Overlay" blend (grayscale centered at 0.5 = neutral):
+//   substrate    = Overlay(baseColor, detail)                 // per channel, display [0,1]
+//   baseDensity  = -gamma * ln(substrate)                     // -> optical density
+//   finalDensity = baseDensity + melaninScale*melaninAmount*melaninAbsorb
+//                              + hemoglobinScale*hemoglobinAmount*hemoglobinAbsorb
+//                              + MELANIN_STRENGTH*(melaninScale-1)*MELANIN_ABSORB
+//                              + HEMOGLOBIN_STRENGTH*(hemoglobinScale-1)*HEMOGLOBIN_ABSORB
+//   albedo = exp(-finalDensity) ^ (1/gamma)
+// (No RGB tint: the editable Base Color is a full global color and subsumes it.)
+const MELANIN_ABSORB    = [1.20, 2.34, 4.20];   // canonical eumelanin absorption (global retone)
+const HEMOGLOBIN_ABSORB = [0.25, 1.80, 1.20];   // canonical hemoglobin absorption (global retone)
+const MELANIN_STRENGTH = 0.70, HEMOGLOBIN_STRENGTH = 0.45;   // how hard a scale slider retones
+
+const SPEC = {
+  parameters: [
+    { id:"melaninScale",    label:"Melanin Scale",    min:0, max:2.5, step:0.001, default:1.0 },
+    { id:"hemoglobinScale", label:"Hemoglobin Scale", min:0, max:2.5, step:0.001, default:1.0 }
+  ],
+  // Skin tones. If a preset omits baseColor, the texture's own extracted color is used.
+  presets: [
+    { label:"Original",   melaninScale:1.0,  hemoglobinScale:1.0 },
+    { label:"흑인 (VI)",  melaninScale:2.0,  hemoglobinScale:1.05 },
+    { label:"백인 (II)",  melaninScale:0.95, hemoglobinScale:1.15 },
+    { label:"황인 (IV)",  melaninScale:1.3,  hemoglobinScale:1.2 },
+    { label:"동아시아",   baseColor:"#e4c1a1", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"동남아시아", baseColor:"#c89a72", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"남아시아",   baseColor:"#a17751", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"중동",       baseColor:"#c9a079", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"라티노",     baseColor:"#c79572", melaninScale:1.0, hemoglobinScale:1.0 }
+  ],
+  // Monk Skin Tone scale (Ellis Monk x Google, 2022) — 10 defined shades.
+  mst: [
+    { label:"MST 1",  baseColor:"#f6ede4", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 2",  baseColor:"#f3e7db", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 3",  baseColor:"#f7ead0", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 4",  baseColor:"#eadaba", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 5",  baseColor:"#d7bd96", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 6",  baseColor:"#a07e56", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 7",  baseColor:"#825c43", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 8",  baseColor:"#604134", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 9",  baseColor:"#3a312a", melaninScale:1.0, hemoglobinScale:1.0 },
+    { label:"MST 10", baseColor:"#292420", melaninScale:1.0, hemoglobinScale:1.0 }
+  ]
+};
+
+const state = { baseColor: [0.78, 0.62, 0.57] };   // editable base skin color, DISPLAY/sRGB [0,1]
+SPEC.parameters.forEach(p => state[p.id] = p.default);
+
+const view = document.getElementById("view");
+let maps = null, GAMMA = 2.2, encLUT = null;
+
+function buildEncLUT(){
+  encLUT = new Uint8ClampedArray(4096);
+  for (let i=0;i<4096;i++) encLUT[i] = Math.round(Math.pow(i/4095, 1/GAMMA)*255);
+}
+function enc(x){ return encLUT[ x<=0?0 : x>=1?4095 : (x*4095)|0 ]; }
+
+function hexToDisp(hex){
+  const n = parseInt(hex.slice(1), 16);
+  return [ (n>>16&255)/255, (n>>8&255)/255, (n&255)/255 ];   // sRGB display [0,1]
+}
+function dispToHex(d){
+  return "#" + d.map(v => Math.round(Math.min(1,Math.max(0,v))*255).toString(16).padStart(2,"0")).join("");
+}
+function linToDispHex(lin){            // linear -> sRGB hex (picker default from baseColor)
+  return dispToHex(lin.map(v => Math.pow(Math.min(1,Math.max(0,v)), 1/GAMMA)));
+}
+function overlay(b, s){ return b < 0.5 ? 2*b*s : 1 - 2*(1-b)*(1-s); }   // Photoshop Overlay
+
+function loadImageData(url){
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const c = document.createElement("canvas"); c.width = img.width; c.height = img.height;
+      const cx = c.getContext("2d"); cx.drawImage(img,0,0);
+      res(cx.getImageData(0,0,img.width,img.height));
+    };
+    img.onerror = rej; img.src = url;
+  });
+}
+function drawThumb(id, imgData){
+  const c = document.getElementById(id); c.width = imgData.width; c.height = imgData.height;
+  c.getContext("2d").putImageData(imgData, 0, 0);
+}
+
+// Decode one texture's decomposition once, cache by dir. This lets us mix maps
+// from different textures (grayscale/base from one, melanin from another, etc.).
+const decompCache = {};
+const sources = { base: null, melanin: null, hemoglobin: null };
+
+async function loadDecomp(dir){
+  if (decompCache[dir]) return decompCache[dir];
+  const meta = await (await fetch(dir + "/decomp.json")).json();
+  const [gray, mel, hem] = await Promise.all([
+    loadImageData(dir + "/" + meta.files.grayscale),
+    loadImageData(dir + "/" + meta.files.melanin),
+    loadImageData(dir + "/" + meta.files.hemoglobin)
+  ]);
+  const w = gray.width, h = gray.height, N = w*h;
+  const detail = new Float32Array(N), melaninAmount = new Float32Array(N), hemoglobinAmount = new Float32Array(N);
+  const alpha = new Uint8Array(N);
+  const gd = gray.data, md = mel.data, hd = hem.data;
+  for (let i=0, p=0; i<N; i++, p+=4){
+    detail[i] = gd[p] / 255;
+    melaninAmount[i]    = (md[p] - meta.zero) / meta.melaninMapScale;
+    hemoglobinAmount[i] = (hd[p] - meta.zero) / meta.hemoglobinMapScale;
+    alpha[i] = gd[p+3];
+  }
+  return decompCache[dir] = {
+    w, h, N, gamma: meta.gamma, detail, alpha, baseColorHex: linToDispHex(meta.baseColor),
+    melaninAmount, melaninAbsorb: meta.melaninAbsorb,
+    hemoglobinAmount, hemoglobinAbsorb: meta.hemoglobinAbsorb,
+    thumbs: { gray, mel, hem }
+  };
+}
+
+// Build the active 'maps' by mixing detail/base + melanin + hemoglobin sources.
+function compose(){
+  const b = decompCache[sources.base], m = decompCache[sources.melanin], hg = decompCache[sources.hemoglobin];
+  if (!b || !m || !hg) return;
+  if (m.N !== b.N || hg.N !== b.N){
+    document.getElementById("readout").textContent = "맵 해상도가 달라 조합 불가 (동일 크기 텍스처끼리만)";
+    return;
+  }
+  GAMMA = b.gamma; buildEncLUT();
+  maps = { w:b.w, h:b.h, N:b.N, detail:b.detail, alpha:b.alpha, baseColorHex:b.baseColorHex,
+           melaninAmount:m.melaninAmount, melaninAbsorb:m.melaninAbsorb,
+           hemoglobinAmount:hg.hemoglobinAmount, hemoglobinAbsorb:hg.hemoglobinAbsorb };
+  drawThumb("t_gray", b.thumbs.gray); drawThumb("t_mel", m.thumbs.mel); drawThumb("t_hem", hg.thumbs.hem);
+  render();
+  updateActive();
+}
+
+async function selectBase(dir){           // Texture button: load everything from this texture
+  const d = await loadDecomp(dir);
+  sources.base = sources.melanin = sources.hemoglobin = dir;
+  state.baseColor = hexToDisp(d.baseColorHex);
+  baseColorInput.value = d.baseColorHex;
+  document.getElementById("baseHex").textContent = d.baseColorHex;
+  compose();
+}
+async function selectMelanin(dir){    await loadDecomp(dir); sources.melanin = dir;    compose(); }
+async function selectHemoglobin(dir){ await loadDecomp(dir); sources.hemoglobin = dir; compose(); }
+
+// highlight the active button in each of the three texture-source rows
+function updateActive(){
+  [["textures", sources.base], ["melRow", sources.melanin], ["hemRow", sources.hemoglobin]].forEach(([id, dir]) => {
+    document.querySelectorAll("#" + id + " .texbtn").forEach(b => b.classList.toggle("active", b.dataset.dir === dir));
+  });
+}
+
+function render(){
+  if (!maps) return;
+  const { w, h, N, detail, melaninAmount, hemoglobinAmount, alpha, melaninAbsorb, hemoglobinAbsorb } = maps;
+  const melaninScale = state.melaninScale, hemoglobinScale = state.hemoglobinScale;
+  const melaninRetone    = MELANIN_STRENGTH*(melaninScale - 1);
+  const hemoglobinRetone = HEMOGLOBIN_STRENGTH*(hemoglobinScale - 1);
+  const retoneR = melaninRetone*MELANIN_ABSORB[0] + hemoglobinRetone*HEMOGLOBIN_ABSORB[0];
+  const retoneG = melaninRetone*MELANIN_ABSORB[1] + hemoglobinRetone*HEMOGLOBIN_ABSORB[1];
+  const retoneB = melaninRetone*MELANIN_ABSORB[2] + hemoglobinRetone*HEMOGLOBIN_ABSORB[2];
+  const base = state.baseColor, negGamma = -GAMMA;
+  const ctx = view.getContext("2d");
+  const out = ctx.createImageData(w, h); const d = out.data;
+  for (let i=0, p=0; i<N; i++, p+=4){
+    const det = detail[i];
+    // substrate = Overlay(baseColor, detail) in display -> optical density (-gamma*ln)
+    const baseDensityR = negGamma*Math.log(Math.max(overlay(base[0], det), 1e-6));
+    const baseDensityG = negGamma*Math.log(Math.max(overlay(base[1], det), 1e-6));
+    const baseDensityB = negGamma*Math.log(Math.max(overlay(base[2], det), 1e-6));
+    d[p]   = enc(Math.exp(-(baseDensityR + melaninScale*melaninAmount[i]*melaninAbsorb[0] + hemoglobinScale*hemoglobinAmount[i]*hemoglobinAbsorb[0] + retoneR)));
+    d[p+1] = enc(Math.exp(-(baseDensityG + melaninScale*melaninAmount[i]*melaninAbsorb[1] + hemoglobinScale*hemoglobinAmount[i]*hemoglobinAbsorb[1] + retoneG)));
+    d[p+2] = enc(Math.exp(-(baseDensityB + melaninScale*melaninAmount[i]*melaninAbsorb[2] + hemoglobinScale*hemoglobinAmount[i]*hemoglobinAbsorb[2] + retoneB)));
+    d[p+3] = alpha[i];
+  }
+  view.width = w; view.height = h;
+  ctx.putImageData(out, 0, 0);
+  document.getElementById("readout").textContent =
+    `base color (sRGB): ${dispToHex(state.baseColor)}   blend: Overlay\n` +
+    `melanin scale    : ${melaninScale.toFixed(3)}     hemoglobin scale : ${hemoglobinScale.toFixed(3)}\n` +
+    `melaninAbsorb / hemoglobinAbsorb : [${melaninAbsorb.map(v=>v.toFixed(2)).join(",")}] / [${hemoglobinAbsorb.map(v=>v.toFixed(2)).join(",")}]`;
+}
+
+// --- UI ----------------------------------------------------------------------
+const baseColorInput = document.getElementById("baseColor");
+baseColorInput.addEventListener("input", () => {
+  state.baseColor = hexToDisp(baseColorInput.value);
+  document.getElementById("baseHex").textContent = baseColorInput.value;
+  render();
+});
+
+const controls = document.getElementById("controls");
+SPEC.parameters.forEach(p => {
+  const row = document.createElement("div"); row.className = "row";
+  const lab = document.createElement("label"); lab.textContent = p.label;
+  const sld = document.createElement("input");
+  Object.assign(sld, { type:"range", min:p.min, max:p.max, step:p.step, value:p.default });
+  const val = document.createElement("span"); val.className = "val";
+  val.textContent = (+p.default).toFixed(2);
+  sld.addEventListener("input", () => {
+    state[p.id] = parseFloat(sld.value);
+    val.textContent = state[p.id].toFixed(2);
+    render();
+  });
+  sld._sync = v => { sld.value = v; val.textContent = (+v).toFixed(2); };
+  row.append(lab, sld, val); controls.appendChild(row);
+  p._slider = sld;
+});
+
+function setBaseColor(hex){
+  state.baseColor = hexToDisp(hex);
+  baseColorInput.value = hex;
+  document.getElementById("baseHex").textContent = hex;
+}
+function applyTone(pr){
+  // explicit baseColor, else restore the loaded texture's own color
+  setBaseColor(pr.baseColor || (maps ? maps.baseColorHex : baseColorInput.value));
+  state.melaninScale = pr.melaninScale; state.hemoglobinScale = pr.hemoglobinScale;
+  SPEC.parameters.forEach(p => p._slider._sync(state[p.id]));
+  render();
+}
+function buildPresetRow(boxId, list){
+  const box = document.getElementById(boxId);
+  list.forEach(pr => {
+    const b = document.createElement("button");
+    if (pr.baseColor){                                  // show the defined color as a swatch
+      const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = pr.baseColor;
+      b.append(sw, document.createTextNode(pr.label));
+    } else {
+      b.textContent = pr.label;
+    }
+    b.addEventListener("click", () => applyTone(pr));
+    box.appendChild(b);
+  });
+}
+buildPresetRow("presets", SPEC.presets);
+buildPresetRow("mst", SPEC.mst);
+
+// --- texture presets (manifest-driven) ---------------------------------------
+const ASSET_BASE = /githack/.test(location.hostname)
+  ? "https://cdn.jsdelivr.net/gh/Jin02/biophysical-skin-renderer-simulator@main"
+  : ".";
+const ROOT = ASSET_BASE + "/skin_presets_v2";
+// Build a row of texture thumbnail buttons; onClick gets the full dir.
+function buildTexRow(boxId, presets, onClick){
+  const box = document.getElementById(boxId); box.innerHTML = "";
+  presets.forEach(pr => {
+    const dir = ROOT + "/" + pr.dir;
+    const b = document.createElement("button"); b.className = "texbtn"; b.dataset.dir = dir;
+    const im = document.createElement("img"); im.src = dir + "/albedo.png";
+    const sp = document.createElement("span"); sp.textContent = pr.label;
+    b.append(im, sp);
+    b.addEventListener("click", () => onClick(dir));
+    box.appendChild(b);
+  });
+}
+async function loadManifest(){
+  const man = await (await fetch(ROOT + "/manifest.json")).json();
+  buildTexRow("textures", man.presets, selectBase);        // load all 4 maps from this texture
+  buildTexRow("melRow",   man.presets, selectMelanin);     // swap only the melanin map
+  buildTexRow("hemRow",   man.presets, selectHemoglobin);  // swap only the hemoglobin map
+  if (man.presets.length) selectBase(ROOT + "/" + man.presets[0].dir);
+}
+
+loadManifest().catch(e => {
+  document.getElementById("readout").textContent = "failed to load skin_presets_v2/manifest.json: " + e;
+});
+</script>
+</body>
+</html>

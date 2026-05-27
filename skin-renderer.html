@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Biophysical Skin Renderer — chromophore maps</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         background:#15171c; color:#d7dbe0; margin:0; padding:24px; }
+  .wrap { max-width:820px; margin:0 auto; display:grid; gap:20px;
+          grid-template-columns: 280px 1fr; }
+  h1 { grid-column:1/-1; font-size:16px; margin:0; color:#fff; }
+  #view { width:280px; height:auto; max-width:280px; border-radius:14px;
+          box-shadow:0 8px 28px rgba(0,0,0,.5); display:block; }
+  .viewbox { display:grid; gap:12px; align-content:start; }
+  .thumbs { display:flex; gap:8px; }
+  .thumb { display:grid; gap:3px; justify-items:center; }
+  .thumb canvas { width:84px; height:84px; border-radius:8px; border:1px solid #2a2f37; }
+  .thumb span { font-size:10px; color:#6b7480; }
+  .row { display:grid; grid-template-columns:120px 1fr 56px; align-items:center; gap:10px; }
+  .row label { color:#9aa3ad; }
+  input[type=range] { width:100%; }
+  .val { text-align:right; color:#cfd6dd; }
+  .prow { grid-column:1/-1; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .plabel { font-size:11px; color:#6b7480; width:54px; }
+  .presets { display:flex; gap:10px; flex-wrap:wrap; }
+  button { background:#262a31; color:#e6eaef; border:1px solid #363b44;
+           border-radius:8px; padding:8px 14px; cursor:pointer; font:inherit; }
+  button:hover { background:#2f343c; }
+  .texbtn { display:flex; align-items:center; gap:6px; padding:4px 8px; }
+  .texbtn img { width:30px; height:30px; border-radius:5px; object-fit:cover; }
+  pre { grid-column:1/-1; background:#1b1e24; border:1px solid #2a2f37;
+        border-radius:10px; padding:14px; margin:0; color:#aeb6bf; white-space:pre-wrap; }
+  .panel { display:grid; gap:12px; align-content:start; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Biophysical Skin Renderer — ICA chromophore maps (substrate × melanin × hemoglobin)</h1>
+
+  <div class="viewbox">
+    <canvas id="view" width="280" height="280"></canvas>
+    <div class="thumbs">
+      <div class="thumb"><canvas id="t_sub"></canvas><span>substrate</span></div>
+      <div class="thumb"><canvas id="t_mel"></canvas><span>melanin</span></div>
+      <div class="thumb"><canvas id="t_hem"></canvas><span>hemoglobin</span></div>
+    </div>
+  </div>
+
+  <div class="panel" id="controls"></div>
+
+  <div class="prow"><span class="plabel">Texture</span><div class="presets" id="textures"></div></div>
+  <div class="prow"><span class="plabel">Tone</span><div class="presets" id="presets"></div></div>
+  <pre id="readout">loading textures …</pre>
+</div>
+
+<script>
+// Map-based recombination. The offline ICA tool (skin_decompose.py) split a base
+// albedo into substrate + melanin/hemoglobin concentration maps with density
+// direction vectors a_m, a_h. Per pixel, in the natural-log density domain:
+//   Moff = MEL_GAIN*(Mscale-1);  Hoff = HEM_GAIN*(Hscale-1)
+//   D_out = D_substrate + Mscale*c_m*a_m + Hscale*c_h*a_h + Moff*MEL_DIR + Hoff*HEM_DIR
+//           + TINT_STRENGTH*(sum(tint) - tint)   // optional RGB tint
+//   albedo = exp(-D_out) ^ (1/gamma)
+// At Mscale=Hscale=1 the offsets are 0 -> original albedo reconstructed exactly.
+// The chromophore maps are zero-mean (spatial variation only; mean pigment lives
+// in the substrate). A Scale slider alone only changes freckle/redness CONTRAST,
+// so to retone the whole face Scale also adds a UNIFORM pigment offset (growing
+// with scale-1; zero at scale 1 -> original preserved). The offset uses canonical
+// eumelanin / hemoglobin RGB density directions (from the forward model, which are
+// known to yield believable skin tones) rather than the per-texture ICA vectors.
+const MEL_DIR = [1.20, 2.34, 4.20];   // canonical eumelanin RGB optical density
+const HEM_DIR = [0.25, 1.80, 1.20];   // canonical hemoglobin RGB optical density
+const MEL_GAIN = 0.70, HEM_GAIN = 0.45;
+const TINT_STRENGTH = 2.5;            // RGB tint: boost a channel by absorbing the other two
+const SPEC = {
+  parameters: [
+    { id:"mScale", label:"Melanin Scale",    min:0, max:2.5, step:0.001, default:1.0 },
+    { id:"hScale", label:"Hemoglobin Scale", min:0, max:2.5, step:0.001, default:1.0 },
+    { id:"tintR",  label:"Red Tint",   min:0, max:1, step:0.001, default:0.0 },
+    { id:"tintG",  label:"Green Tint", min:0, max:1, step:0.001, default:0.0 },
+    { id:"tintB",  label:"Blue Tint",  min:0, max:1, step:0.001, default:0.0 }
+  ],
+  presets: [
+    { label:"Original",  mScale:1.0, hScale:1.0 },
+    { label:"흑인 (VI)", mScale:2.0, hScale:1.05 },
+    { label:"백인 (II)", mScale:0.95, hScale:1.15 },
+    { label:"황인 (IV)", mScale:1.3,  hScale:1.2 }
+  ]
+};
+
+const state = {};
+SPEC.parameters.forEach(p => state[p.id] = p.default);
+
+const view = document.getElementById("view");
+let maps = null;   // precomputed per-pixel arrays + metadata
+
+// gamma encode LUT for x in [0,1]
+let GAMMA = 2.2, encLUT = null;
+function buildEncLUT(){
+  encLUT = new Uint8ClampedArray(4096);
+  for (let i=0;i<4096;i++) encLUT[i] = Math.round(Math.pow(i/4095, 1/GAMMA)*255);
+}
+function enc(x){ return encLUT[ x<=0?0 : x>=1?4095 : (x*4095)|0 ]; }
+
+function loadImageData(url){
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";   // allow getImageData when assets are CORS-served
+    img.onload = () => {
+      const c = document.createElement("canvas"); c.width = img.width; c.height = img.height;
+      const cx = c.getContext("2d"); cx.drawImage(img,0,0);
+      res(cx.getImageData(0,0,img.width,img.height));
+    };
+    img.onerror = rej; img.src = url;
+  });
+}
+
+function drawThumb(id, imgData){
+  const c = document.getElementById(id); c.width = imgData.width; c.height = imgData.height;
+  c.getContext("2d").putImageData(imgData, 0, 0);
+}
+
+async function loadMaps(dir){
+  const meta = await (await fetch(dir + "/decomp.json")).json();
+  const [sub, mel, hem] = await Promise.all([
+    loadImageData(dir + "/" + meta.files.substrate),
+    loadImageData(dir + "/" + meta.files.melanin),
+    loadImageData(dir + "/" + meta.files.hemoglobin)
+  ]);
+  GAMMA = meta.gamma; buildEncLUT();
+  const w = sub.width, h = sub.height, N = w*h;
+  const Dr = new Float32Array(N), Dg = new Float32Array(N), Db = new Float32Array(N);
+  const cm = new Float32Array(N), ch = new Float32Array(N);
+  const alpha = new Uint8Array(N);
+  const s = sub.data, md = mel.data, hd = hem.data, g = meta.gamma;
+  for (let i=0, p=0; i<N; i++, p+=4){
+    const lr = Math.max(Math.pow(s[p]  /255, g), 1e-6);
+    const lg = Math.max(Math.pow(s[p+1]/255, g), 1e-6);
+    const lb = Math.max(Math.pow(s[p+2]/255, g), 1e-6);
+    Dr[i] = -Math.log(lr); Dg[i] = -Math.log(lg); Db[i] = -Math.log(lb);
+    cm[i] = (md[p] - meta.zero) / meta.m_scale;
+    ch[i] = (hd[p] - meta.zero) / meta.h_scale;
+    alpha[i] = s[p+3];
+  }
+  maps = { w, h, N, Dr, Dg, Db, cm, ch, alpha, am: meta.a_m, ah: meta.a_h, meta };
+  drawThumb("t_sub", sub); drawThumb("t_mel", mel); drawThumb("t_hem", hem);
+  render();
+}
+
+function render(){
+  if (!maps){ return; }
+  const { w, h, N, Dr, Dg, Db, cm, ch, alpha, am, ah } = maps;
+  const M = state.mScale, H = state.hScale;
+  // uniform retone offset (grows with scale-1; zero at scale 1 -> original) along
+  // canonical eumelanin / hemoglobin density directions.
+  const Moff = MEL_GAIN*(M - 1), Hoff = HEM_GAIN*(H - 1);
+  const t = [state.tintR, state.tintG, state.tintB], sT = t[0]+t[1]+t[2];
+  const oR = Moff*MEL_DIR[0] + Hoff*HEM_DIR[0] + TINT_STRENGTH*(sT - t[0]);
+  const oG = Moff*MEL_DIR[1] + Hoff*HEM_DIR[1] + TINT_STRENGTH*(sT - t[1]);
+  const oB = Moff*MEL_DIR[2] + Hoff*HEM_DIR[2] + TINT_STRENGTH*(sT - t[2]);
+  const ctx = view.getContext("2d");
+  const out = ctx.createImageData(w, h); const d = out.data;
+  for (let i=0, p=0; i<N; i++, p+=4){
+    const tr = Dr[i] + M*cm[i]*am[0] + H*ch[i]*ah[0] + oR;
+    const tg = Dg[i] + M*cm[i]*am[1] + H*ch[i]*ah[1] + oG;
+    const tb = Db[i] + M*cm[i]*am[2] + H*ch[i]*ah[2] + oB;
+    d[p]   = enc(Math.exp(-tr));
+    d[p+1] = enc(Math.exp(-tg));
+    d[p+2] = enc(Math.exp(-tb));
+    d[p+3] = alpha[i];
+  }
+  view.width = w; view.height = h;
+  ctx.putImageData(out, 0, 0);
+  document.getElementById("readout").textContent =
+    `melanin scale    : ${M.toFixed(3)}     hemoglobin scale : ${H.toFixed(3)}\n` +
+    `a_m (density dir): [${am.map(v=>v.toFixed(3)).join(", ")}]\n` +
+    `a_h (density dir): [${ah.map(v=>v.toFixed(3)).join(", ")}]\n` +
+    `tint RGB         : [${state.tintR.toFixed(2)}, ${state.tintG.toFixed(2)}, ${state.tintB.toFixed(2)}]   (scale 1,1 + tint 0 = original)`;
+}
+
+// --- UI ----------------------------------------------------------------------
+const controls = document.getElementById("controls");
+SPEC.parameters.forEach(p => {
+  const row = document.createElement("div"); row.className = "row";
+  const lab = document.createElement("label"); lab.textContent = p.label;
+  const sld = document.createElement("input");
+  Object.assign(sld, { type:"range", min:p.min, max:p.max, step:p.step, value:p.default });
+  const val = document.createElement("span"); val.className = "val";
+  val.textContent = (+p.default).toFixed(2);
+  sld.addEventListener("input", () => {
+    state[p.id] = parseFloat(sld.value);
+    val.textContent = state[p.id].toFixed(2);
+    render();
+  });
+  sld._sync = v => { sld.value = v; val.textContent = (+v).toFixed(2); };
+  row.append(lab, sld, val); controls.appendChild(row);
+  p._slider = sld;
+});
+
+const presets = document.getElementById("presets");
+SPEC.presets.forEach(pr => {
+  const b = document.createElement("button"); b.textContent = pr.label;
+  b.addEventListener("click", () => {
+    state.mScale = pr.mScale; state.hScale = pr.hScale;
+    state.tintR = state.tintG = state.tintB = 0;
+    SPEC.parameters.forEach(p => p._slider._sync(state[p.id]));
+    render();
+  });
+  presets.appendChild(b);
+});
+
+// --- texture presets (manifest-driven) ---------------------------------------
+// Same-origin (local server / GitHub Pages) uses relative paths. When served via
+// the raw.githack CDN (HTML only, binaries lack CORS), load the maps from jsDelivr
+// instead, which sends Access-Control-Allow-Origin:* so getImageData works.
+const ASSET_BASE = /githack/.test(location.hostname)
+  ? "https://cdn.jsdelivr.net/gh/Jin02/biophysical-skin-renderer-simulator@main"
+  : ".";
+const ROOT = ASSET_BASE + "/skin_presets";
+async function loadManifest(){
+  const man = await (await fetch(ROOT + "/manifest.json")).json();
+  const box = document.getElementById("textures");
+  box.innerHTML = "";
+  man.presets.forEach(pr => {
+    const b = document.createElement("button"); b.className = "texbtn";
+    const im = document.createElement("img"); im.src = ROOT + "/" + pr.dir + "/albedo.png";
+    const sp = document.createElement("span"); sp.textContent = pr.label;
+    b.append(im, sp);
+    b.addEventListener("click", () => loadMaps(ROOT + "/" + pr.dir));
+    box.appendChild(b);
+  });
+  if (man.presets.length) loadMaps(ROOT + "/" + man.presets[0].dir);
+}
+
+loadManifest().catch(e => {
+  document.getElementById("readout").textContent = "failed to load skin_presets/manifest.json: " + e;
+});
+</script>
+</body>
+</html>

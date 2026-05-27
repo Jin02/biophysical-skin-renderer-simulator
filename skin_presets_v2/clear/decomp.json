@@ -1,0 +1,30 @@
+{
+  "gamma": 2.2,
+  "eps": 0.001,
+  "blend": "overlay",
+  "baseColor": [
+    0.692073,
+    0.500859,
+    0.453108
+  ],
+  "melaninAbsorb": [
+    0.021287747117595186,
+    0.04291919677219506,
+    0.06718613991839842
+  ],
+  "hemoglobinAbsorb": [
+    0.023982283352440674,
+    0.14148402935735355,
+    0.07370814709029266
+  ],
+  "melaninMapScale": 12.964890287630004,
+  "hemoglobinMapScale": 20.094047496800087,
+  "zero": 128,
+  "width": 256,
+  "height": 256,
+  "files": {
+    "grayscale": "grayscale.png",
+    "melanin": "melanin.png",
+    "hemoglobin": "hemoglobin.png"
+  }
+}

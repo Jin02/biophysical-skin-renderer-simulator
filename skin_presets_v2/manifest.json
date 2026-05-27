@@ -1,0 +1,29 @@
+{
+  "presets": [
+    {
+      "id": "freckled",
+      "label": "Freckled",
+      "dir": "freckled"
+    },
+    {
+      "id": "clear",
+      "label": "Clear",
+      "dir": "clear"
+    },
+    {
+      "id": "ruddy",
+      "label": "Ruddy",
+      "dir": "ruddy"
+    },
+    {
+      "id": "olive",
+      "label": "Olive",
+      "dir": "olive"
+    },
+    {
+      "id": "deep",
+      "label": "Deep",
+      "dir": "deep"
+    }
+  ]
+}
